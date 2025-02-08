@@ -9,9 +9,8 @@
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
     "isolatedModules": true,
-    "noEmit": true,
-    "types": ["node","vite/client"]
+    "noEmit": true
   },
-  "include": ["**/*.ts"],
-  "exclude": ["node_modules"]
+  "include": ["**/*.ts", "eslint.config.mjs"],
+  "exclude": ["node_modules", "packages/plugin/src/test.js"]
 }

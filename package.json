@@ -3,9 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "prepare": "husky init",
-    "lint": "eslint . --fix",
-    "format": "prettier --write ."
+    "prepare": "husky",
+    "lint": "eslint . --fix --ignore-pattern 'packages/demo1/**'",
+    "format": "prettier --write .",
+    "lint:demo1": "cd packages/demo1 && pnpm exec eslint . --fix",
+    "lint:plugin": "eslint packages/plugin --fix",
+    "lint:all": "npm run lint:demo1 && npm run lint:plugin"
   },
   "workspaces": [
     "packages/*"
@@ -29,5 +32,9 @@
       "eslint --fix",
       "prettier --write"
     ]
-  }
+  },
+  "eslint.workingDirectories": [
+    "./packages/demo1",
+    "./packages/plugin"
+  ]
 }

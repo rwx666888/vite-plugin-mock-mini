@@ -1,0 +1,10 @@
+@import './base.css';
+
+#app {
+
+  font-weight: normal;
+}
+
+.main-page-wrap {
+  padding: 15px;
+}
