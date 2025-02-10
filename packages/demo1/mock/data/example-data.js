@@ -1,4 +1,5 @@
 import Mock from 'mockjs'
+import t2 from './t2.js'
 
 // demo 数据 用于演示数据的生成
 
@@ -201,7 +202,7 @@ function demoFnMakeInfoPageData(obj) {
  * 啥也不干就是玩
  */
 function demoFnEmpty() {
-  return ''
+  return t2
 }
 
 // 用于缓存数据 只为demo演示使用

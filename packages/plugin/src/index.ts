@@ -304,8 +304,6 @@ function _sleep(timeout: number) {
  * 文件依赖关系类型定义
  */
 type FileDependencyInfo = {
-  /** 是否为顶层文件 */
-  isTopLevel: boolean;
   /** 依赖的文件路径数组 */
   dependencies: string[];
   /** 被哪些顶层文件依赖 */
@@ -393,90 +391,103 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
    * @param {string[]} dependencies - 依赖文件路径数组
    * @param {any} mod - 模块内容
    */
-  const updateFileDependencyInfo = (filePath: string, dependencies: string[], mod: any) => {
+  const updateFileDependencyInfo = (
+    filePath: string,
+    dependencies: string[] = [],
+    mod: any = null
+  ) => {
+    if (!filePath) return;
+
     const projectRoot = process.cwd();
 
-    // 过滤掉自身的依赖
-    const realDependencies = dependencies.filter((dep) => {
-      // 将相对路径转换为绝对路径进行比较
-      const absoluteDepPath = path.resolve(projectRoot, dep).replace(/\\/g, '/');
-      return absoluteDepPath !== filePath;
-    });
+    // 依赖路径转换为绝对路径 并过滤掉自身的依赖
+    const realDependencies = dependencies
+      .map((dep) => path.resolve(projectRoot, dep).replace(/\\/g, '/'))
+      .filter((absoluteDepPath) => absoluteDepPath !== filePath);
 
-    // 检查是否为顶层文件
-    const isTopLevel = !Array.from(fileDependencyMap.values()).some((info) =>
-      info.dependencies
-        .map((dep) => path.resolve(projectRoot, dep).replace(/\\/g, '/'))
-        .includes(filePath)
-    );
+    // 获取现有文件信息
+    const existingInfo = fileDependencyMap.get(filePath);
 
-    // 直接从 mod 中获取 mockData
-    const mockData = mod?.default || mod;
-
-    console.log('---filePath--1--\n', filePath, '\n----');
-    // 更新文件信息
+    // 更新当前文件信息，保留现有的 topLevelDependents
     fileDependencyMap.set(filePath, {
-      isTopLevel,
-      dependencies: realDependencies, // 保存相对路径
-      topLevelDependents: [],
-      mockData: Array.isArray(mockData) ? mockData : undefined
+      dependencies: realDependencies,
+      // 保留现有的 topLevelDependents 是必要的，因为这些信息是其他文件对当前文件的依赖关系
+      // 如果不保留，会丢失其他文件对该文件的依赖信息
+      topLevelDependents: existingInfo?.topLevelDependents || [],
+      mockData: Array.isArray(mod?.default || mod) ? mod?.default || mod : undefined
     });
 
-    // 更新被依赖关系
-    for (const dep of realDependencies) {
-      // 获取依赖文件的绝对路径
-      const absoluteDepPath = path.resolve(projectRoot, dep).replace(/\\/g, '/');
-      const depInfo = fileDependencyMap.get(absoluteDepPath) || {
-        isTopLevel: false,
-        dependencies: [],
-        topLevelDependents: []
-      };
-
-      if (isTopLevel && !depInfo.topLevelDependents.includes(filePath)) {
-        depInfo.topLevelDependents.push(filePath);
+    // 清理旧的依赖关系
+    if (existingInfo) {
+      const removedDeps = existingInfo.dependencies.filter(
+        (dep) => !realDependencies.includes(dep)
+      );
+      for (const removedDep of removedDeps) {
+        const depInfo = fileDependencyMap.get(removedDep);
+        if (depInfo) {
+          depInfo.topLevelDependents = depInfo.topLevelDependents.filter((dep) => dep !== filePath);
+          fileDependencyMap.set(removedDep, depInfo);
+        }
       }
-      fileDependencyMap.set(absoluteDepPath, depInfo);
     }
 
-    // 打印 fileDependencyMap
-    fileDependencyMap.forEach((value, key) => {
-      console.log('--init-fileDependencyMap--\n', key, value, '\n----');
-    });
+    // 更新所有依赖文件的信息
+    for (const absoluteDepPath of realDependencies) {
+      try {
+        const depInfo = fileDependencyMap.get(absoluteDepPath) || {
+          dependencies: [],
+          topLevelDependents: [],
+          mockData: undefined
+        };
+
+        // 被依赖的文件一定不是顶层文件
+        // 避免重复添加到 topLevelDependents
+        if (!depInfo.topLevelDependents.includes(filePath)) {
+          depInfo.topLevelDependents.push(filePath);
+        }
+
+        fileDependencyMap.set(absoluteDepPath, depInfo);
+      } catch (error) {
+        console.error(`更新依赖文件信息失败: ${absoluteDepPath}`, error);
+      }
+    }
   };
 
   /**
-   * 递归获取所有顶层依赖文件
-   * @param  filePath - 文件路径
-   * @param  visited - 已访问的文件集合，用于防止循环依赖
-   * @returns  顶层依赖文件路径数组
+   * 处理文件删除
+   * @param {string} deletedFilePath - 被删除的文件路径
    */
-  const getAllTopLevelDependents = (filePath: string, visited = new Set<string>()): string[] => {
-    if (visited.has(filePath)) {
-      return [];
-    }
-    visited.add(filePath);
+  const handleFileDelete = async (deletedFilePath: string) => {
+    const fileInfo = fileDependencyMap.get(deletedFilePath);
+    if (!fileInfo) return;
 
-    const fileInfo = fileDependencyMap.get(filePath);
-    if (!fileInfo) {
-      // 如果找不到文件信息,返回文件本身
-      return [filePath];
-    }
-
-    // 如果是顶层文件，直接返回自身
-    if (fileInfo.isTopLevel) {
-      return [filePath];
+    // 从所有依赖文件的 topLevelDependents 中移除对该文件的引用
+    for (const depPath of fileInfo.dependencies) {
+      const depInfo = fileDependencyMap.get(depPath);
+      if (depInfo) {
+        depInfo.topLevelDependents = depInfo.topLevelDependents.filter(
+          (dep) => dep !== deletedFilePath
+        );
+        fileDependencyMap.set(depPath, depInfo);
+      }
     }
 
-    // 递归获取所有直接依赖此文件的文件的顶层依赖
-    const allTopLevelDependents = Array.from(fileDependencyMap.entries())
-      .filter(([_, info]) => info.dependencies.includes(filePath))
-      .flatMap(([dependentPath]) => getAllTopLevelDependents(dependentPath, visited));
-
-    return [...new Set(allTopLevelDependents)];
+    const topLevelFiles = fileInfo.topLevelDependents;
+    // 重新加载受影响的顶层文件
+    for (const topLevelFile of topLevelFiles) {
+      await loadMockFile(topLevelFile);
+    }
+    fileDependencyMap.delete(deletedFilePath);
   };
 
   // 加载mock文件
   const loadMockFile = async (filePath: string) => {
+    // 如果该文件已经被其他文件依赖，说明它不是顶层文件，直接跳过加载
+    const fileInfo = fileDependencyMap.get(filePath);
+    if (fileInfo && fileInfo.topLevelDependents.length > 0) {
+      console.log(`Skip loading non-top-level file: ${filePath}`);
+      return;
+    }
     try {
       const { mod, dependencies } = await bundleRequire({
         filepath: filePath,
@@ -502,28 +513,10 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
       updateFileDependencyInfo(filePath, dependencies, mod);
     } catch (error) {
       console.error(`Error loading mock file: ${filePath}`, error);
-      // 发生错误时更新依赖信息，但清除 mockData
-      // updateFileDependencyInfo(filePath, [], null);
+      // 发生错误时更新依赖信息，并清除 mockData
+      updateFileDependencyInfo(filePath, [], null);
     }
   };
-
-  // 加载mock目录下的文件
-  /*   const loadMockDir = async () => {
-    mockData = []; // 清空旧数据
-    const files = await glob(_opt.mockFileMatch, {
-      cwd: mockDirPath,
-      ignore: _ignore,
-      absolute: true,
-      onlyFiles: true
-    });
-
-    for (const file of files) {
-      const data = await loadMockFile(file);
-      if (Array.isArray(data)) {
-        mockData = mockData.concat(data);
-      }
-    }
-  }; */
 
   /**
    * 更新mock数据
@@ -533,43 +526,11 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
   const updateMockData = async (changedFilePath?: string, event?: 'add' | 'change' | 'unlink') => {
     try {
       if (changedFilePath && event) {
-        // 获取需要重新加载的文件
-        // 遍历打印 fileDependencyMap
-        fileDependencyMap.forEach((value, key) => {
-          console.log('---fileDependencyMap--\n', key, value, '\n----');
-        });
-        const filesToReload = getAllTopLevelDependents(changedFilePath);
-        console.log('---filesToReload--\n', filesToReload, '\n----');
-        const isTopLevel = filesToReload[0] === changedFilePath;
-
         if (event === 'unlink') {
-          // 文件被删除
-          if (isTopLevel) {
-            // 如果是顶层文件，直接从映射中删除
-            fileDependencyMap.delete(changedFilePath);
-          } else {
-            // 如果是被依赖文件，尝试重新加载依赖它的顶层文件
-            // 这样会在顶层文件中产生编译错误，更符合开发者预期
-            for (const topLevelFile of filesToReload) {
-              try {
-                await loadMockFile(topLevelFile);
-              } catch (error) {
-                console.error(
-                  `重新加载顶层文件 ${topLevelFile} 失败，可能是由于依赖文件 ${changedFilePath} 被删除:`,
-                  error
-                );
-                // 保留错误状态，但清除该文件的 mockData
-                const topLevelInfo = fileDependencyMap.get(topLevelFile);
-                if (topLevelInfo) {
-                  topLevelInfo.mockData = undefined;
-                }
-              }
-            }
-            // 最后删除被依赖文件的映射信息
-            fileDependencyMap.delete(changedFilePath);
-          }
+          await handleFileDelete(changedFilePath);
         } else {
-          // 对于新增或修改，尝试加载文件
+          // 对于新增或修改，获取需要重新加载的顶层文件
+          const filesToReload = fileDependencyMap.get(changedFilePath)?.topLevelDependents || [];
           for (const file of filesToReload) {
             await loadMockFile(file);
           }
@@ -583,12 +544,6 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
           onlyFiles: true
         });
 
-        // 清理已不存在的文件
-        for (const [filePath] of fileDependencyMap) {
-          if (!files.includes(filePath)) {
-            fileDependencyMap.delete(filePath);
-          }
-        }
         console.log('---files--\n', files, '\n----');
 
         // 加载所有文件
@@ -597,12 +552,12 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
         }
       }
 
-      // 从 fileDependencyMap 中收集所有有效的 mockData
+      // 收集所有有效的mockData
       mockData = Array.from(fileDependencyMap.values())
-        .filter((info) => Array.isArray(info.mockData))
+        .filter((info) => info.topLevelDependents.length === 0 && Array.isArray(info.mockData))
         .flatMap((info) => info.mockData as MockData[]);
     } catch (error) {
-      console.error('更新 mock 数据失败:', error);
+      console.error('更新mock数据失败:', error);
     }
   };
 

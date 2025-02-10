@@ -1,5 +1,7 @@
+// @ts-nocheck
 import tmpData from './data/example-data.js'
 import type { MockData } from 'vite-plugin-mock-mini'
+import t1 from './data/t1.js'
 export default [
   {
     url: '/testapi/get',
@@ -33,7 +35,7 @@ export default [
       console.log('--mock-1--\n req', req.query, req.body, req.params, '---\n')
       return {
         code: 0,
-        list: []
+        list: t1
       }
     }
   } as MockData,
