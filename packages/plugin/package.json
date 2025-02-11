@@ -2,6 +2,9 @@
   "name": "vite-plugin-mock-mini",
   "version": "1.0.0",
   "description": "A lightweight mock server plugin for Vite",
+  "files": [
+    "dist"
+  ],
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.mjs",
@@ -15,7 +18,10 @@
   },
   "scripts": {
     "build": "unbuild",
-    "dev": "unbuild --stub"
+    "dev": "unbuild --stub",
+    "prepublishOnly": "unbuild",
+    "pack": "npm pack",
+    "publish": "npm publish --registry=https://registry.npmjs.org"
   },
   "keywords": [
     "vite",

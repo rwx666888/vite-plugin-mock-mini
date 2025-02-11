@@ -29,3 +29,4 @@ yarn-error.log*
 
 # Misc
 .DS_Store
+packages/plugin/vite-plugin-mock-mini-*.tgz
