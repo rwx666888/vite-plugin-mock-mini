@@ -22,7 +22,8 @@ export default defineConfig({
       // 定义 mock 数据文件存放的目录
       mockDir: 'mock',
       routerParserEnabled: true,
-      routerPath: '/testapi'
+      routerPath: '/testapi',
+      showLog: 'info'
     })
   ],
   resolve: {

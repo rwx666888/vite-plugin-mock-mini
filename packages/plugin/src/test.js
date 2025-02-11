@@ -12,4 +12,8 @@ const projectRoot = process.cwd().replace(/\\/g, '/');
 console.log('---3--\n ', process.cwd(), '--\n--', path.resolve(process.cwd(), 'c'), '---\n');
 console.log('---4--\n ', path.posix.resolve(projectRoot, 'c/b'), '$$', projectRoot, '---\n');
 console.log('---5--\n ', import.meta.url, '---\n');
-console.log('---6--\n ', path.posix.join('dir', 'subdir', 'file.txt'), path.sep, '---\n');
+console.log(
+  '---6--\n ',
+  path.join(path.resolve(process.cwd(), 'mock'), '**\/*.{js,ts,cjs,mjs}'),
+  '---\n'
+);

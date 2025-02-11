@@ -1,7 +1,7 @@
 import { Plugin, Connect } from 'vite';
 import path from 'path';
 import chokidar from 'chokidar';
-import { glob } from 'fast-glob';
+import fastGlob from 'fast-glob';
 import crypto from 'crypto';
 import { bundleRequire, GetOutputFile } from 'bundle-require';
 import bodyParser from 'body-parser';
@@ -28,6 +28,8 @@ export type MockData = {
   timeout?: number;
   /** 是否不返回json数据，默认 false */
   isNotJson?: boolean;
+  /** @internal path-to-regexp 的 match 函数 */
+  __matchFn?: ReturnType<typeof match>;
 } & (
   | {
       isNotJson: true;
@@ -63,6 +65,10 @@ export type mockApiServerOptions = {
     /** 启用param解析器 默认 true */
     param?: boolean;
   };
+  /**
+   * 是否显示日志 默认 false
+   */
+  showLog?: 'info' | 'error' | false;
   /**
    * 需要使用解析器的路由路径 默认 ''
    * @description 建议mock的接口路径与实际接口路径分离，目的是尽可能规避解析器对非mock接口的影响
@@ -142,15 +148,15 @@ function _extendRequestMiddleware(
   res: ServerResponse,
   next: Connect.NextFunction
 ) {
-  const __1req = req as TypeExtendReq;
-  if (!__1req.params) __1req.params = {}; // 如果没有 params，初始化为 {}
-  if (!__1req.query) __1req.query = {}; // 如果没有 query，初始化为 {}
-  if (!__1req.body) __1req.body = {}; // 如果没有 body，初始化为 {}
+  const _req = req as TypeExtendReq;
+  if (!_req.params) _req.params = {}; // 如果没有 params，初始化为 {}
+  if (!_req.query) _req.query = {}; // 如果没有 query，初始化为 {}
+  if (!_req.body) _req.body = {}; // 如果没有 body，初始化为 {}
   // 检查 param 方法是否已存在
-  if (!__1req.param) {
+  if (!_req.param) {
     // 使用箭头函数避免 this 绑定问题
-    __1req.param = (paramName: string) => {
-      return __1req.body?.[paramName] || __1req.query?.[paramName] || __1req.params?.[paramName];
+    _req.param = (paramName: string) => {
+      return _req.body?.[paramName] || _req.query?.[paramName] || _req.params?.[paramName];
     };
   }
   next();
@@ -212,8 +218,11 @@ async function handerFn(
     if (method && method.toUpperCase() !== _req.method?.toUpperCase()) {
       return false;
     }
-    const matchPath = match(item.url);
-    const matchFlag = matchPath(_req.url?.split('?')[0] || '');
+    // 使用缓存的 match 函数
+    if (!item.__matchFn) {
+      item.__matchFn = match(item.url);
+    }
+    const matchFlag = item.__matchFn(_req.url?.split('?')[0] || '');
     return !!matchFlag;
   });
 
@@ -317,9 +326,31 @@ type FileDependencyInfo = {
  */
 type FileDependencyMap = Map<string, FileDependencyInfo>;
 
+/**
+ * 创建日志记录器
+ * @param {string} level  - 日志级别，默认为 false
+ * @returns {Object} 包含 info 和 error 方法的对象
+ */
+function createLogger(level: false | 'info' | 'error' = false) {
+  return {
+    info: (...args: any[]) => {
+      if (level === 'info') {
+        console.log('[vite-plugin-mock-mini]', ...args);
+      }
+    },
+    error: (...args: any[]) => {
+      if (level === 'error' || level === 'info') {
+        console.error('[vite-plugin-mock-mini]', ...args);
+      }
+    }
+  };
+}
+
 export function mockApiServer(options?: mockApiServerOptions): Plugin {
   // 存储 mock 数据
   let mockData: MockData[] = [];
+
+  const __logger = createLogger(options?.showLog || false);
 
   // 存储文件依赖关系
   const fileDependencyMap: FileDependencyMap = new Map();
@@ -408,13 +439,20 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
     // 获取现有文件信息
     const existingInfo = fileDependencyMap.get(filePath);
 
-    // 更新当前文件信息，保留现有的 topLevelDependents
+    // 处理 mockData，添加 __matchFn
+    let processedMockData: MockData[] | undefined = undefined;
+    if (Array.isArray(mod?.default || mod)) {
+      processedMockData = (mod?.default || mod).map((item: MockData) => ({
+        ...item,
+        __matchFn: match(item.url)
+      }));
+    }
+
+    // 更新文件信息
     fileDependencyMap.set(filePath, {
       dependencies: realDependencies,
-      // 保留现有的 topLevelDependents 是必要的，因为这些信息是其他文件对当前文件的依赖关系
-      // 如果不保留，会丢失其他文件对该文件的依赖信息
-      topLevelDependents: existingInfo?.topLevelDependents || [],
-      mockData: Array.isArray(mod?.default || mod) ? mod?.default || mod : undefined
+      topLevelDependents: [],
+      mockData: processedMockData
     });
 
     // 清理旧的依赖关系
@@ -448,7 +486,7 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
 
         fileDependencyMap.set(absoluteDepPath, depInfo);
       } catch (error) {
-        console.error(`更新依赖文件信息失败: ${absoluteDepPath}`, error);
+        __logger.error(`更新依赖文件信息失败: ${absoluteDepPath}`, error);
       }
     }
   };
@@ -485,7 +523,7 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
     // 如果该文件已经被其他文件依赖，说明它不是顶层文件，直接跳过加载
     const fileInfo = fileDependencyMap.get(filePath);
     if (fileInfo && fileInfo.topLevelDependents.length > 0) {
-      console.log(`Skip loading non-top-level file: ${filePath}`);
+      __logger.info(`Skip loading non-top-level file: ${filePath}`);
       return;
     }
     try {
@@ -508,13 +546,20 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
           );
         })
       });
-      console.log('---filePath--\n', filePath, '\n dependencies', dependencies, '\n----');
+      __logger.info('---loadMockFile--\n', filePath, '\n dependencies: ', dependencies, '\n----');
 
       updateFileDependencyInfo(filePath, dependencies, mod);
     } catch (error) {
-      console.error(`Error loading mock file: ${filePath}`, error);
-      // 发生错误时更新依赖信息，并清除 mockData
-      updateFileDependencyInfo(filePath, [], null);
+      __logger.error(`Error loading mock file: ${filePath}`, error);
+      // 获取现有的依赖信息
+      const existingInfo = fileDependencyMap.get(filePath);
+      if (existingInfo) {
+        // 保留原有的依赖关系，只清除 mockData
+        fileDependencyMap.set(filePath, {
+          ...existingInfo,
+          mockData: undefined // 只清除 mockData，保留依赖关系
+        });
+      }
     }
   };
 
@@ -528,23 +573,43 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
       if (changedFilePath && event) {
         if (event === 'unlink') {
           await handleFileDelete(changedFilePath);
+        } else if (event === 'add') {
+          // 检查是否有其他文件依赖这个新文件
+          // 这可能是由于文件重命名或恢复导致的
+          const dependentFiles = Array.from(fileDependencyMap.entries())
+            .filter(([_, info]) => info.dependencies.includes(changedFilePath))
+            .map(([filePath]) => filePath);
+
+          if (dependentFiles.length > 0) {
+            // 重新编译所有依赖这个文件的顶层文件
+            for (const depFile of dependentFiles) {
+              await loadMockFile(depFile);
+            }
+          } else {
+            // 作为独立的顶层文件加载
+            await loadMockFile(changedFilePath);
+          }
         } else {
-          // 对于新增或修改，获取需要重新加载的顶层文件
-          const filesToReload = fileDependencyMap.get(changedFilePath)?.topLevelDependents || [];
+          // 修改文件
+          const fileInfo = fileDependencyMap.get(changedFilePath);
+          const filesToReload = fileInfo?.topLevelDependents.length
+            ? fileInfo.topLevelDependents // 如果有顶层依赖文件,返回依赖数组
+            : [changedFilePath]; // 如果没有顶层依赖,返回当前文件数组
+
           for (const file of filesToReload) {
             await loadMockFile(file);
           }
         }
       } else {
         // 完整加载目录
-        const files = await glob(_opt.mockFileMatch, {
+        const files = await fastGlob.glob(_opt.mockFileMatch, {
           cwd: mockDirPath,
           ignore: _ignore,
           absolute: true,
           onlyFiles: true
         });
 
-        console.log('---files--\n', files, '\n----');
+        __logger.info('---all-mock-files--\n', files, '\n----');
 
         // 加载所有文件
         for (const file of files) {
@@ -557,7 +622,7 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
         .filter((info) => info.topLevelDependents.length === 0 && Array.isArray(info.mockData))
         .flatMap((info) => info.mockData as MockData[]);
     } catch (error) {
-      console.error('更新mock数据失败:', error);
+      __logger.error('更新mock数据失败:', error);
     }
   };
 
@@ -566,23 +631,41 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
     async configureServer(server) {
       await updateMockData();
 
-      // console.log('--5--\n mockData', mockData, '\n----');
+      // 遍历 打印 fileDependencyMap
+      /* fileDependencyMap.forEach((value, key) => {
+        console.log('--init--fileDependencyMap--\n', key, ' \n', value, '\n----');
+      }); */
+
       // 使用 chokidar 监控文件变化，排除临时文件
-      const watcher = chokidar.watch(mockDirPath, {
+      const watchPattern = path.join(mockDirPath, _opt.mockFileMatch);
+      const watcher = chokidar.watch(watchPattern, {
         ignored: _ignore,
         ignoreInitial: true
       });
 
       watcher.on('all', async (event, changedFilePath) => {
+        __logger.info('changedFilePath:', event, changedFilePath);
         if (event === 'add' || event === 'change' || event === 'unlink') {
-          await updateMockData(changedFilePath, event);
+          await updateMockData(changedFilePath.replace(/\\/g, '/'), event);
           /* server.ws.send({
             type: 'custom',
             event: 'mock-data-updated',
             data: mockData
           }); */
+
+          // 遍历 打印 fileDependencyMap
+          /* fileDependencyMap.forEach((value, key) => {
+            console.log(
+              '--change--fileDependencyMap--\n',
+              event,
+              '-#-',
+              key,
+              ' \n',
+              value,
+              '\n----'
+            );
+          }); */
         }
-        console.log('--2--\n changedFilePath', event, changedFilePath);
       });
 
       // 添加 routerParser 的解析器
@@ -596,9 +679,13 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
         }
       }
 
+      const __regex = /\/$/;
+
       // 提供一个接口供客户端访问 mock 数据
       server.middlewares.use(async (req, res, next) => {
-        const isMatchPath = _routerPaths.some((path) => req.url?.startsWith(path));
+        const isMatchPath = _routerPaths.some((path) =>
+          req.url?.startsWith(path.replace(__regex, '') + '/')
+        );
         if (isMatchPath) {
           await handerFn(req, res, next, mockData);
         } else {
