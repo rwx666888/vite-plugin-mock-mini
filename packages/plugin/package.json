@@ -19,9 +19,8 @@
   "scripts": {
     "build": "unbuild",
     "dev": "unbuild --stub",
-    "prepublishOnly": "unbuild",
     "pack": "npm pack",
-    "publish": "npm publish --registry=https://registry.npmjs.org"
+    "publish": "unbuild && npm publish --registry=https://registry.npmjs.org"
   },
   "keywords": [
     "vite",
