@@ -8,7 +8,7 @@ interface CusInternalAxiosRequestConfig extends InternalAxiosRequestConfig {
 }
 
 const defConfig: AxiosRequestConfig = {
-  baseURL: import.meta.env.VUE_APP_BASE,
+  baseURL: import.meta.env.VITE_APP_BASE,
   headers: {
     'content-type': 'application/json'
   },
@@ -21,7 +21,7 @@ instance.interceptors.request.use(
   (config: CusInternalAxiosRequestConfig) => {
     // Control whether to enable mock-server only in development environment
     if (import.meta.env.NODE_ENV === 'development' && config.useMockServer === true) {
-      config.baseURL = import.meta.env.VUE_APP_MOCK_SERVER
+      config.baseURL = import.meta.env.VITE_APP_MOCK_SERVER
     }
 
     return config

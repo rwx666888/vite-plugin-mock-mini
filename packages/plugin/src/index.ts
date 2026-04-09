@@ -39,7 +39,7 @@ export type MockData = {
   | {
       isNotJson?: false;
       /** 响应数据或返回响应数据的函数 - JSON响应时使用 */
-      response: { [key: string]: any } | ((req: TypeExtendReq) => { [key: string]: any });
+      response: unknown | ((req: TypeExtendReq) => unknown | Promise<unknown>);
     }
 );
 
@@ -62,15 +62,13 @@ export type mockApiServerOptions = {
     raw?: boolean;
     /** 启用query解析器 默认 true */
     query?: boolean;
-    /** 启用param解析器 默认 true */
-    param?: boolean;
   };
   /**
    * 是否显示日志 默认 false
    */
   showLog?: 'info' | 'error' | false;
   /**
-   * 需要使用解析器的路由路径 默认 ''
+   * 限制插件只处理指定前缀下的请求 默认 ''
    * @description 建议mock的接口路径与实际接口路径分离，目的是尽可能规避解析器对非mock接口的影响
    * 支持字符串或字符串数组，例如:
    * - 字符串: '/mock-api'
@@ -78,16 +76,12 @@ export type mockApiServerOptions = {
    */
   routerPath?: string | string[];
   /**
-   * 是否启用 routerParser 中的路由解析器，默认 true，
-   * @description 目的是尽可能规避 解析器对非mock接口的影响，否则可能导致接口影响异常；
-
-   *  开启：则应用routerParser 中开启的解析器，
-   *
-   *   -- routerPath 不为空 则 解析器 只匹配 routerPath 路径;
-   *
-   *   -- routerPath 为空 则 解析器 匹配注入的mock接口地址 ;
-   *
-   *  关闭：则不应用routerParser 中开启的解析器，注意：routerParserArr 中解析器依旧有效
+   * 是否启用内置请求解析器，默认 true
+   * @description
+   * - true: 按 routerParser 配置启用 json/url/txt/raw/query 解析
+   * - false: 不启用上述内置解析器
+   * - routerParserArr 请求/响应扩展中间件始终有效
+   * - 解析器链只会在命中 mock 路由后执行
    */
   routerParserEnabled?: boolean;
   /**
@@ -110,13 +104,14 @@ export type mockApiServerOptions = {
 
 type _opt = mockApiServerOptions & {
   mockFileMatch: string;
+  routerParserEnabled: boolean;
 };
 
 // 修改 TypeExtendReq 类型定义，继承 IncomingMessage
 type TypeExtendReq = Connect.IncomingMessage & {
   params: Record<string, any>;
   query: Record<string, any>;
-  body: Record<string, any>;
+  body: any;
   param: (paramName: string) => any;
 };
 
@@ -135,6 +130,20 @@ type TypeExtendRes = ServerResponse & {
    * @param {any} body - 要发送的JSON数据
    */
   json(body: any): void;
+};
+
+type MatchResult = Exclude<ReturnType<ReturnType<typeof match>>, false>;
+
+type RouteBucket = {
+  staticRoutes: Map<string, MockData>;
+  dynamicRoutes: MockData[];
+};
+
+type RouteIndex = Map<string, RouteBucket>;
+
+type MockRouteMatch = {
+  target: MockData;
+  params: Record<string, any>;
 };
 
 /**
@@ -184,7 +193,7 @@ function _extendResponseMiddleware(
 
   if (!_response.json) {
     _response.json = (body: any): void => {
-      _response.setHeader('Content-Type', 'application/json');
+      _response.setHeader('Content-Type', 'application/json; charset=utf-8');
       _response.end(JSON.stringify(body));
     };
   }
@@ -193,43 +202,244 @@ function _extendResponseMiddleware(
 }
 
 /**
+ * 规范化请求路径
+ * @description
+ * - 仅保留路径部分，不包含 query
+ * - 尝试对 URL 中的编码字符进行解码，提升中文路径等场景的匹配兼容性
+ * - 如果解码失败，则退回原始路径，避免请求阶段因为异常而中断
+ * @param {string | undefined} url - 原始请求地址
+ * @returns {string} 规范化后的请求路径
+ */
+function normalizeRequestPath(url?: string) {
+  const pathname = (url || '').split('?')[0] || '/';
+  try {
+    return decodeURI(pathname);
+  } catch (_) {
+    return pathname;
+  }
+}
+
+/**
+ * 判断路由是否为动态路由
+ * @description path-to-regexp 风格的动态路径通常包含 : * ? () + 等标记
+ * @param {string} url - mock 路由配置中的 url
+ * @returns {boolean} 是否为动态路由
+ */
+function isDynamicRoute(url: string) {
+  return /[:*?()+]/.test(url);
+}
+
+/**
+ * 构建路由索引
+ * @description
+ * 将原始 mockData 按 HTTP Method 分桶，再拆分为：
+ * - staticRoutes: 静态路由，使用 Map 直接命中
+ * - dynamicRoutes: 动态路由，保留顺序后续逐个匹配
+ *
+ * 这样做的目的是把大多数静态请求从 O(n) 扫描降为接近 O(1) 查找，
+ * 动态路由则只在对应 method 的子集合中继续匹配。
+ * @param {MockData[]} mockData - 当前全部有效的 mock 配置
+ * @returns {RouteIndex} 路由索引表
+ */
+function buildRouteIndex(mockData: MockData[]): RouteIndex {
+  const routeIndex: RouteIndex = new Map();
+
+  for (const item of mockData) {
+    const method = (item.method || 'GET').toUpperCase();
+    const bucket = routeIndex.get(method) || {
+      staticRoutes: new Map<string, MockData>(),
+      dynamicRoutes: []
+    };
+
+    if (isDynamicRoute(item.url)) {
+      bucket.dynamicRoutes.push(item);
+    } else {
+      bucket.staticRoutes.set(item.url, item);
+    }
+
+    routeIndex.set(method, bucket);
+  }
+
+  return routeIndex;
+}
+
+/**
+ * 从路由索引中查找命中的 mock 路由
+ * @description
+ * 匹配顺序为：
+ * 1. 先按 method 找到对应桶
+ * 2. 优先匹配静态路由
+ * 3. 再遍历动态路由并复用已缓存的 __matchFn
+ *
+ * 如果命中动态路由，同时返回 params，避免后续再进行第二次扫描。
+ * @param {RouteIndex} routeIndex - 路由索引表
+ * @param {string | undefined} method - 当前请求方法
+ * @param {string} urlPath - 规范化后的请求路径
+ * @returns {MockRouteMatch | null} 命中的结果，未命中时返回 null
+ */
+function findMockRoute(routeIndex: RouteIndex, method: string | undefined, urlPath: string) {
+  const bucket = routeIndex.get((method || 'GET').toUpperCase());
+  if (!bucket) return null;
+
+  const staticRoute = bucket.staticRoutes.get(urlPath);
+  if (staticRoute) {
+    return {
+      target: staticRoute,
+      params: {}
+    } as MockRouteMatch;
+  }
+
+  for (const item of bucket.dynamicRoutes) {
+    const matched = item.__matchFn?.(urlPath);
+    if (matched) {
+      return {
+        target: item,
+        params: (matched as MatchResult).params || {}
+      };
+    }
+  }
+
+  return null;
+}
+
+/**
+ * 判断请求体是否已经被上游解析过
+ * @description
+ * 某些项目可能已经通过其它中间件提前注入了 req.body，
+ * 此时再次执行 body-parser 既没有必要，也可能带来兼容性问题。
+ * @param {Connect.IncomingMessage} req - 请求对象
+ * @returns {boolean} 是否已经存在 body
+ */
+function hasParsedBody(req: Connect.IncomingMessage) {
+  return typeof (req as TypeExtendReq).body !== 'undefined';
+}
+
+/**
+ * 创建“按需执行”的 body 解析器包装器
+ * @description
+ * 只有在请求体尚未被解析时，才真正调用 body-parser；
+ * 否则直接跳过，尽量减少和其它中间件的冲突。
+ * @param {Connect.NextHandleFunction} parser - 原始解析器
+ * @returns {Connect.NextHandleFunction} 包装后的解析器
+ */
+function createConditionalBodyParser(
+  parser: Connect.NextHandleFunction
+): Connect.NextHandleFunction {
+  return (req, res, next) => {
+    if (hasParsedBody(req)) {
+      next();
+      return;
+    }
+    parser(req, res, next);
+  };
+}
+
+/**
+ * 顺序执行一组 Connect 中间件
+ * @description
+ * 由于插件现在改为“命中 mock 后再按需解析”，这里需要手动串联中间件执行顺序。
+ * 执行过程中具备以下特性：
+ * - 前一个中间件完成后，再进入下一个
+ * - 如果响应已经结束，则后续中间件不再执行
+ * - 任意中间件抛错或 next(error) 时，会中断并上抛异常
+ * @param {Connect.IncomingMessage} req - 请求对象
+ * @param {ServerResponse} res - 响应对象
+ * @param {Connect.NextHandleFunction[]} middlewares - 中间件数组
+ * @returns {Promise<void>} 执行完成后的 Promise
+ */
+function runMiddlewares(
+  req: Connect.IncomingMessage,
+  res: ServerResponse,
+  middlewares: Connect.NextHandleFunction[]
+) {
+  return middlewares.reduce<Promise<void>>((promise, middleware) => {
+    return promise.then(
+      () =>
+        new Promise<void>((resolve, reject) => {
+          if (res.writableEnded) {
+            resolve();
+            return;
+          }
+          try {
+            middleware(req, res, (error?: unknown) => {
+              if (error) {
+                reject(error);
+                return;
+              }
+              resolve();
+            });
+          } catch (error) {
+            reject(error);
+          }
+        })
+    );
+  }, Promise.resolve());
+}
+
+/**
+ * 发送文本错误响应
+ * @param {ServerResponse} res - 响应对象
+ * @param {number} statusCode - 状态码
+ * @param {string} message - 错误文本
+ */
+function sendTextError(res: ServerResponse, statusCode: number, message: string) {
+  res.statusCode = statusCode;
+  res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+  res.end(message);
+}
+
+/**
+ * 发送 mock 结果
+ * @description
+ * - 当结果为 Buffer 时，按二进制响应输出
+ * - 其它情况按 JSON 响应输出
+ * - 如果上游已设置 Content-Type，则优先保留用户自定义响应头
+ * @param {ServerResponse} res - 响应对象
+ * @param {number} statusCode - HTTP 状态码
+ * @param {unknown} result - mock 返回值
+ */
+function sendMockResult(res: ServerResponse, statusCode: number, result: unknown) {
+  res.statusCode = statusCode;
+
+  if (Buffer.isBuffer(result)) {
+    if (!res.hasHeader('Content-Type')) {
+      res.setHeader('Content-Type', 'application/octet-stream');
+    }
+    res.end(result);
+    return;
+  }
+
+  if (!res.hasHeader('Content-Type')) {
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+  }
+  res.end(JSON.stringify(result));
+}
+
+/**
  * 处理mock请求的核心函数
  * @param req - 请求对象
  * @param res - 响应对象
  * @param next - 下一个中间件
- * @param mockData - mock数据数组
+ * @param matchedRoute - 命中的 mock 路由
  */
 async function handerFn(
   req: Connect.IncomingMessage,
   res: ServerResponse,
   next: Connect.NextFunction,
-  mockData: MockData[]
+  matchedRoute: MockRouteMatch | null
 ) {
   const _req = req as TypeExtendReq;
 
-  if (!_req.url) {
+  if (!_req.url || !matchedRoute) {
     next();
     return;
   }
 
-  // 匹配路由
-  const _target = mockData.find((item) => {
-    const { method = 'GET' } = item;
-    if (method && method.toUpperCase() !== _req.method?.toUpperCase()) {
-      return false;
-    }
-    // 使用缓存的 match 函数
-    if (!item.__matchFn) {
-      item.__matchFn = match(item.url);
-    }
-    const matchFlag = item.__matchFn(_req.url?.split('?')[0] || '');
-    return !!matchFlag;
-  });
+  // 动态路由参数始终在命中路由后注入到 req.params，
+  // 这样可以避免旧实现中在独立中间件阶段对所有 mock 做二次扫描
+  _req.params = matchedRoute.params;
 
-  if (!_target) {
-    next();
-    return;
-  }
+  const _target = matchedRoute.target;
 
   // 处理延时
   if (_target.timeout) {
@@ -241,35 +451,28 @@ async function handerFn(
     if (typeof _target.response === 'function') {
       _target.response(_req, res as TypeExtendRes);
     } else {
-      res.statusCode = 500;
-      res.end('---error---  response must be a function when isNotJson is true');
+      sendTextError(res, 500, '---error--- response must be a function when isNotJson is true');
     }
   } else {
     if (typeof _target.response === 'function') {
       try {
         const _result = await Promise.resolve(_target.response(_req));
-        res.statusCode = _target.status || 200;
-        res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify(_result));
+        sendMockResult(res, _target.status || 200, _result);
       } catch (_) {
-        res.statusCode = 500;
-        res.setHeader('Content-Type', 'text/plain');
-        res.end('---error--- The response function returns data that is not valid JSON.');
+        sendTextError(
+          res,
+          500,
+          '---error--- The response function returns data that is not valid JSON.'
+        );
       }
-    } else if (typeof _target.response === 'object') {
+    } else if (typeof _target.response !== 'function') {
       try {
-        res.statusCode = _target.status || 200;
-        res.setHeader('Content-Type', 'application/json');
-        res.end(JSON.stringify(_target.response));
+        sendMockResult(res, _target.status || 200, _target.response);
       } catch (_) {
-        res.statusCode = 500;
-        res.setHeader('Content-Type', 'text/plain');
-        res.end('---error--- response is not valid JSON.');
+        sendTextError(res, 500, '---error--- response is not valid JSON.');
       }
     } else {
-      res.statusCode = 500;
-      res.setHeader('Content-Type', 'text/plain');
-      res.end('---error--- response is not function or object');
+      sendTextError(res, 500, '---error--- response is not function or object');
     }
   }
 }
@@ -278,27 +481,17 @@ async function handerFn(
 function queryParser() {
   return (req: Connect.IncomingMessage, res: ServerResponse, next: Connect.NextFunction) => {
     const _req = req as TypeExtendReq;
-    if (_req.originalUrl) {
-      const parsedUrl = new URL(_req.originalUrl, `http://${_req.headers.host}`);
-      _req.query = qs.parse(parsedUrl.search.slice(1));
-    }
-    next();
-  };
-}
-
-// 解析路径参数并附加到 req.params
-function paramParser(getMockData: () => MockData[]) {
-  return (req: Connect.IncomingMessage, res: ServerResponse, next: Connect.NextFunction) => {
-    const _req = req as TypeExtendReq;
-    if (_req.originalUrl) {
-      const mockData = getMockData();
-      for (const route of mockData) {
-        const matcher = match(route.url);
-        const matched = matcher(_req.originalUrl.split('?')[0]);
-        if (matched) {
-          _req.params = matched.params || {};
-          break;
-        }
+    const currentUrl = _req.originalUrl || _req.url;
+    if (currentUrl) {
+      try {
+        // 构造 URL 对象时需要补一个基础 host；
+        // 如果上游没有提供 host，则退回 localhost，避免 new URL 直接抛错
+        const host = _req.headers.host || 'localhost';
+        const parsedUrl = new URL(currentUrl, `http://${host}`);
+        _req.query = qs.parse(parsedUrl.search.slice(1));
+      } catch (_) {
+        // URL 解析失败时，兜底为空对象，避免因为异常影响整个请求处理链
+        _req.query = {};
       }
     }
     next();
@@ -349,6 +542,7 @@ function createLogger(level: false | 'info' | 'error' = false) {
 export function mockApiServer(options?: mockApiServerOptions): Plugin {
   // 存储 mock 数据
   let mockData: MockData[] = [];
+  let routeIndex: RouteIndex = new Map();
 
   const __logger = createLogger(options?.showLog || false);
 
@@ -359,13 +553,13 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
   const _opt: _opt = {
     mockDir: 'mock',
     mockFileMatch: '',
+    routerParserEnabled: true,
     routerParser: {
       json: true,
       url: true,
       txt: true,
       raw: true,
       query: true,
-      param: true,
       ..._routerParser
     },
     ...otherOpt
@@ -388,19 +582,24 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
   // 获取 mock 目录
   const mockDirPath = path.resolve(process.cwd(), _opt.mockDir || 'mock');
 
+  /**
+   * 内置请求解析器映射表
+   * @description
+   * 这里只描述“能力”，不代表一定会对每个请求执行；
+   * 真正的执行时机是在命中 mock 路由之后，由 applyMockMiddlewares 统一串行调用。
+   */
   const _routerParserMap = {
-    json: bodyParser.json(),
-    url: bodyParser.urlencoded({ extended: true }),
-    txt: bodyParser.text(),
-    raw: bodyParser.raw(),
-    query: queryParser(),
-    param: paramParser(() => mockData)
+    json: createConditionalBodyParser(bodyParser.json()),
+    url: createConditionalBodyParser(bodyParser.urlencoded({ extended: true })),
+    txt: createConditionalBodyParser(bodyParser.text()),
+    raw: createConditionalBodyParser(bodyParser.raw()),
+    query: queryParser()
   };
 
   // 添加类型定义
   type RouterParserKey = keyof typeof _routerParserMap;
 
-  // 获取 routerParser 的解析器
+  // 根据用户配置筛选出真正启用的内置解析器
   const _routerParserArr = _opt.routerParserEnabled
     ? Object.entries(_opt.routerParser || {}).reduce((acc, [key, value]) => {
         if (value === true && _routerParserMap[key as RouterParserKey]) {
@@ -410,11 +609,10 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
       }, [] as Connect.NextHandleFunction[])
     : ([] as Connect.NextHandleFunction[]);
 
-  // 添加扩展请求和响应中间件
+  // 无论是否启用 body/query 解析，这两个扩展中间件都应始终存在：
+  // - _extendRequestMiddleware: 兜底初始化 req.params / req.query / req.body / req.param
+  // - _extendResponseMiddleware: 为 res 增加 status/json 等便捷方法
   _routerParserArr.push(_extendRequestMiddleware, _extendResponseMiddleware);
-
-  _routerParserArr.unshift(...((_opt.routerParserArr || [[], []])[0] || []));
-  _routerParserArr.push(...((_opt.routerParserArr || [[], []])[1] || []));
 
   /**
    * 更新文件依赖信息
@@ -430,11 +628,20 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
     if (!filePath) return;
 
     const projectRoot = process.cwd();
+    const normalizedProjectRoot = path.resolve(projectRoot).replace(/\\/g, '/');
 
-    // 依赖路径转换为绝对路径 并过滤掉自身的依赖
+    // 依赖路径转换为绝对路径，并过滤以下内容：
+    // 1. 自身路径，避免出现自依赖
+    // 2. 项目根目录之外的路径，避免把无关文件纳入依赖图
+    // 3. node_modules，避免第三方包进入热更新依赖追踪导致依赖图膨胀
     const realDependencies = dependencies
       .map((dep) => path.resolve(projectRoot, dep).replace(/\\/g, '/'))
-      .filter((absoluteDepPath) => absoluteDepPath !== filePath);
+      .filter(
+        (absoluteDepPath) =>
+          absoluteDepPath !== filePath &&
+          absoluteDepPath.startsWith(normalizedProjectRoot) &&
+          !absoluteDepPath.includes('/node_modules/')
+      );
 
     // 获取现有文件信息
     const existingInfo = fileDependencyMap.get(filePath);
@@ -621,9 +828,49 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
       mockData = Array.from(fileDependencyMap.values())
         .filter((info) => info.topLevelDependents.length === 0 && Array.isArray(info.mockData))
         .flatMap((info) => info.mockData as MockData[]);
+      routeIndex = buildRouteIndex(mockData);
     } catch (error) {
       __logger.error('更新mock数据失败:', error);
     }
+  };
+
+  /**
+   * 判断当前请求是否应该交给插件处理
+   * @description
+   * - 未配置 routerPath：默认认为所有请求都可参与 mock 匹配
+   * - 配置了 routerPath：仅处理指定前缀本身或其子路径
+   * @param {string} urlPath - 规范化后的请求路径
+   * @returns {boolean} 是否进入 mock 处理链
+   */
+  const shouldHandleRequest = (urlPath: string) => {
+    const validBasePaths = _routerPaths
+      .map((basePath) => basePath.replace(/\/$/, ''))
+      .filter((basePath) => !!basePath);
+    if (validBasePaths.length === 0) return true;
+    return validBasePaths.some(
+      (basePath) => urlPath === basePath || urlPath.startsWith(`${basePath}/`)
+    );
+  };
+
+  /**
+   * 在命中 mock 路由后执行解析器链
+   * @description
+   * 执行顺序为：
+   * 1. 用户自定义 before 中间件
+   * 2. 插件内置解析器与请求/响应扩展中间件
+   * 3. 用户自定义 after 中间件
+   *
+   * 之所以在这里统一执行，而不是像旧实现一样提前 use 到全局中间件链，
+   * 是为了把解析动作限制在 mock 请求内部，降低对普通 Vite 请求的影响。
+   */
+  const applyMockMiddlewares = async (req: Connect.IncomingMessage, res: ServerResponse) => {
+    const middlewareChain = [
+      ...((_opt.routerParserArr || [[], []])[0] || []),
+      ..._routerParserArr,
+      ...((_opt.routerParserArr || [[], []])[1] || [])
+    ];
+
+    await runMiddlewares(req, res, middlewareChain);
   };
 
   return {
@@ -643,53 +890,90 @@ export function mockApiServer(options?: mockApiServerOptions): Plugin {
         ignoreInitial: true
       });
 
+      // 批量更新相关状态
+      // updateTimer: 轻量去抖定时器，合并短时间内的多次文件变化
+      // updateQueue: 保证批量刷新任务串行执行，避免并发重复编译
+      // pendingUpdates: 缓存本轮待处理的文件事件
+      let updateTimer: ReturnType<typeof setTimeout> | undefined;
+      let updateQueue = Promise.resolve();
+      const pendingUpdates = new Map<string, 'add' | 'change' | 'unlink'>();
+
+      /**
+       * 刷新积压的文件变更
+       * @description
+       * 将同一批次收集到的文件事件串行提交给 updateMockData，
+       * 完成后通过 Vite WebSocket 向客户端发送自定义更新事件。
+       */
+      const flushPendingUpdates = () => {
+        const updates = Array.from(pendingUpdates.entries());
+        pendingUpdates.clear();
+
+        updateQueue = updateQueue
+          .then(async () => {
+            for (const [filePath, event] of updates) {
+              await updateMockData(filePath, event);
+            }
+            if (updates.length > 0) {
+              server.ws.send({
+                type: 'custom',
+                event: 'mock:update'
+              });
+            }
+          })
+          .catch((error) => {
+            __logger.error('批量更新 mock 数据失败:', error);
+          });
+      };
+
       watcher.on('all', async (event, changedFilePath) => {
         __logger.info('changedFilePath:', event, changedFilePath);
         if (event === 'add' || event === 'change' || event === 'unlink') {
-          await updateMockData(changedFilePath.replace(/\\/g, '/'), event);
-          /* server.ws.send({
-            type: 'custom',
-            event: 'mock-data-updated',
-            data: mockData
-          }); */
-
-          // 遍历 打印 fileDependencyMap
-          /* fileDependencyMap.forEach((value, key) => {
-            console.log(
-              '--change--fileDependencyMap--\n',
-              event,
-              '-#-',
-              key,
-              ' \n',
-              value,
-              '\n----'
-            );
-          }); */
+          // 文件变化统一进入待处理队列；同一个文件在短时间内重复变更时，
+          // 以最后一次事件为准，减少不必要的重复编译与依赖重建。
+          pendingUpdates.set(changedFilePath.replace(/\\/g, '/'), event);
+          if (updateTimer) return;
+          updateTimer = setTimeout(() => {
+            updateTimer = undefined;
+            flushPendingUpdates();
+          }, 800);
         }
       });
 
-      // 添加 routerParser 的解析器
-      if (_routerParserArr.length > 0) {
-        if (_opt.routerPath) {
-          _routerPaths.forEach((path) => {
-            _routerParserArr.forEach((middleware) => {
-              server.middlewares.use(path, middleware);
-            });
-          });
+      // Vite 服务关闭时及时释放 watcher 与定时器，避免开发期反复启动造成资源泄漏
+      server.httpServer?.once('close', () => {
+        if (updateTimer) {
+          clearTimeout(updateTimer);
+          updateTimer = undefined;
         }
-      }
-
-      const __regex = /\/$/;
+        void watcher.close();
+      });
 
       // 提供一个接口供客户端访问 mock 数据
       server.middlewares.use(async (req, res, next) => {
-        const isMatchPath = _routerPaths.some((path) =>
-          req.url?.startsWith(path.replace(__regex, '') + '/')
-        );
-        if (isMatchPath) {
-          await handerFn(req, res, next, mockData);
-        } else {
+        // 第一步：规范化请求路径，并根据 routerPath 过滤非 mock 请求
+        const urlPath = normalizeRequestPath(req.url);
+        if (!shouldHandleRequest(urlPath)) {
+          // 非 mock 请求，直接传递给 Vite
           next();
+          return;
+        }
+
+        // 第二步：通过路由索引查找命中的 mock 路由
+        const matchedRoute = findMockRoute(routeIndex, req.method, urlPath);
+        if (!matchedRoute) {
+          // 未命中 mock 路由，直接传递给 Vite
+          next();
+          return;
+        }
+
+        try {
+          // 第三步：命中后再执行解析器链，尽量减少对普通请求的副作用
+          await applyMockMiddlewares(req, res);
+          if (res.writableEnded) return;
+          // 第四步：执行最终 mock 响应；动态路由参数会在这里按命中结果自动注入
+          await handerFn(req, res, next, matchedRoute);
+        } catch (error) {
+          next(error as Error);
         }
       });
     }

@@ -36,7 +36,6 @@
     "unbuild": "^3.2.0"
   },
   "peerDependencies": {
-    "body-parser": "^1.20.2",
     "vite": "^5.0.0"
   },
   "dependencies": {
