@@ -398,7 +398,7 @@ type mockApiServerOptions = {
 ### `ignore`
 
 - 类型：`string | string[]`
-- 默认值：自动忽略临时编译文件
+- 默认值：自动忽略临时编译文件（'\*\*\/\_\_tmp-\*-\*\_\_.\*'）
 - 说明：额外忽略的文件规则
 
 ### `routerPath`
